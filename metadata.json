@@ -1,0 +1,6 @@
+{
+  "name": "C2 Wake Studio",
+  "description": "Custom Volume-Button Screen Wake & Lock Android App Builder, Interactive Hardware Simulator, and ColorOS 6 Setup Guide for Realme C2 devices with a broken power button.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
