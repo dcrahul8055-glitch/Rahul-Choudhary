@@ -54,12 +54,20 @@ export const RealmeSetupGuide: React.FC<RealmeSetupGuideProps> = ({ config }) =>
         'Allow "Install from Unknown Sources" for Chrome or Files, install the APK, open the app, and tap "1. Start Screen-Off Volume Service".',
     },
     {
+      id: 'android13-restricted',
+      phase: 'ColorOS 6 Background Survival',
+      title: 'Unlock "Restricted Settings" (Android 13 / 14 Sideloaded APKs)',
+      path: `Settings -> Apps -> App Management -> ${appLabel} -> Top-Right 3 Dots (⋮) -> Allow restricted settings`,
+      detail:
+        'If Android shows "Restricted setting: For your security, this setting is currently unavailable" when enabling Accessibility, open App Info for the app, tap the top-right 3 dots (⋮), and tap "Allow restricted settings" (confirm with PIN/fingerprint). Then return to Accessibility.',
+    },
+    {
       id: 'coloros-accessibility',
       phase: 'ColorOS 6 Background Survival',
       title: 'Grant Accessibility Key Filter Permission',
-      path: `Settings -> Additional Settings -> Accessibility -> ${appLabel} Volume Controller`,
+      path: `Settings -> Additional Settings -> Accessibility -> Downloaded Apps -> ${appLabel} Volume Controller`,
       detail:
-        'Required so Android 9 delivers hardware Volume Up / Volume Down events to the app and allows instant screen lock via GLOBAL_ACTION_LOCK_SCREEN without root.',
+        'Required so Android delivers hardware Volume Up / Volume Down events to the app and allows instant screen lock via GLOBAL_ACTION_LOCK_SCREEN without root.',
     },
     {
       id: 'coloros-lock-recents',
