@@ -50,6 +50,7 @@ export function generateAndroidProject(config: C2WakeConfig): GeneratedProjectFi
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     ${config.hapticFeedback ? '<uses-permission android:name="android.permission.VIBRATE" />' : '<!-- VIBRATE disabled in configuration -->'}
     ${config.startOnBoot ? '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />' : '<!-- RECEIVE_BOOT_COMPLETED disabled in configuration -->'}
 
@@ -99,6 +100,21 @@ export function generateAndroidProject(config: C2WakeConfig): GeneratedProjectFi
             android:name=".ScreenWakeForegroundService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Optional Device Admin fallback so screen lock works even without Accessibility -->
+        <receiver
+            android:name=".LockDeviceAdminReceiver"
+            android:description="@string/device_admin_description"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin_policies" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
 ${
   config.startOnBoot
     ? `
@@ -117,6 +133,14 @@ ${
 </manifest>
 `;
 
+  const deviceAdminXml = `<?xml version="1.0" encoding="utf-8"?>
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <force-lock />
+    </uses-policies>
+</device-admin>
+`;
+
   const accessibilityConfigXml = `<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged"
@@ -132,6 +156,7 @@ ${
     <string name="app_name">${safeAppName}</string>
     <string name="accessibility_service_label">${safeAppName} Volume Controller</string>
     <string name="accessibility_service_description">Intercepts Volume Up and Volume Down button presses to turn the screen on and lock the screen without using the physical power button.</string>
+    <string name="device_admin_description">Allows ${safeAppName} to turn off and lock the screen without using the physical power button.</string>
 </resources>
 `;
 
@@ -183,6 +208,12 @@ object WakeManager {
 
     @Volatile
     var isAccessibilityConnected: Boolean = false
+
+    @Volatile
+    var wakeGestureMode: String = WakeConfig.WAKE_GESTURE
+
+    @Volatile
+    var pocketProtectionEnabled: Boolean = WakeConfig.POCKET_PROTECTION
 
     @Volatile
     var lastEventSummary: String = "No volume presses detected yet"
@@ -245,6 +276,23 @@ object WakeManager {
 
         triggerHaptic(context)
         recordEvent(context, "Woke screen via $source")
+    }
+
+    fun lockScreenViaAdminIfEnabled(context: Context): Boolean {
+        return try {
+            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as android.app.admin.DevicePolicyManager
+            val admin = android.content.ComponentName(context, LockDeviceAdminReceiver::class.java)
+            if (dpm.isAdminActive(admin)) {
+                dpm.lockNow()
+                triggerHaptic(context)
+                recordEvent(context, "Locked screen via Device Admin")
+                true
+            } else {
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     fun triggerHaptic(context: Context) {
@@ -434,15 +482,18 @@ class VolumeKeyAccessibilityService : AccessibilityService(), SensorEventListene
 
             val now = SystemClock.elapsedRealtime()
             val delta = now - lastClickTimeMs
-            val isDoubleClick = (code == lastClickKey) && (delta in 1..WakeConfig.DOUBLE_CLICK_WINDOW_MS)
+            val windowMs = if (!screenOn) maxOf(WakeConfig.DOUBLE_CLICK_WINDOW_MS, 800L) else WakeConfig.DOUBLE_CLICK_WINDOW_MS
+            val sameOrEither = (code == lastClickKey) || (!screenOn && WakeConfig.WAKE_KEY == "EITHER")
+            val isDoubleClick = sameOrEither && (delta in 1..windowMs)
 
             if (!screenOn && matchesKey(code, WakeConfig.WAKE_KEY)) {
-                if (WakeConfig.WAKE_GESTURE == "SINGLE_CLICK") {
+                val activeWakeMode = WakeManager.wakeGestureMode
+                if (activeWakeMode == "SINGLE_CLICK") {
                     lastClickTimeMs = 0L
                     wakeIfNotInPocket("$keyName Single Click")
                     return true
                 }
-                if (WakeConfig.WAKE_GESTURE == "DOUBLE_CLICK") {
+                if (activeWakeMode == "DOUBLE_CLICK") {
                     if (isDoubleClick) {
                         lastClickTimeMs = 0L
                         wakeIfNotInPocket("$keyName Double Click (\${delta}ms)")
@@ -460,7 +511,7 @@ class VolumeKeyAccessibilityService : AccessibilityService(), SensorEventListene
                 if (WakeConfig.MEDIA_SAFEGUARD && isAudioOrCallActive()) {
                     return false
                 }
-                if (isDoubleClick) {
+                if (code == lastClickKey && delta in 1..WakeConfig.DOUBLE_CLICK_WINDOW_MS) {
                     lastClickTimeMs = 0L
                     lockScreenNow("$keyName Double Click (\${delta}ms)")
                     return true
@@ -493,7 +544,7 @@ class VolumeKeyAccessibilityService : AccessibilityService(), SensorEventListene
     }
 
     private fun wakeIfNotInPocket(source: String) {
-        if (WakeConfig.POCKET_PROTECTION && isNearPocket) {
+        if (WakeManager.pocketProtectionEnabled && isNearPocket) {
             WakeManager.recordEvent(this, "Wake blocked by proximity sensor")
             return
         }
@@ -541,8 +592,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -550,6 +603,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
 import android.os.IBinder
@@ -562,28 +616,64 @@ import androidx.core.app.ServiceCompat
 import androidx.media.VolumeProviderCompat
 
 /**
- * Keeps hardware Volume button detection alive while the screen is OFF.
+ * Reliable screen-off Volume Button Wake Service (v1.3.0).
  *
- * Uses TWO coordinated mechanisms so screen-off volume presses work reliably across
- * Android 9 (Realme C2) through Android 14 (Realme 12x 5G RMX3998):
- *  1. Holds a PARTIAL_WAKE_LOCK so the CPU never drops Volume key hardware interrupts.
- *  2. Primes a MediaSessionCompat with a brief silent AudioTrack pulse + VolumeProviderCompat
- *     so Android routes screen-off volume events even on OEMs that suppress Accessibility keys.
+ * Why screen-off Volume wake previously missed clicks:
+ * Android's PhoneWindowManager drops hardware Volume keys while the screen is OFF unless
+ * active audio playback is running. This service listens for ACTION_SCREEN_OFF, starts a
+ * 0-volume looping silent AudioTrack ONLY while the screen is off, and catches volume clicks
+ * through BOTH MediaSessionCompat.VolumeProviderCompat AND android.media.VOLUME_CHANGED_ACTION,
+ * then stops the silent track the instant the screen wakes (ACTION_SCREEN_ON).
  */
 class ScreenWakeForegroundService : Service(), SensorEventListener {
 
     private lateinit var powerManager: PowerManager
+    private lateinit var audioManager: AudioManager
     private var mediaSession: MediaSessionCompat? = null
+    private var silentAudioTrack: AudioTrack? = null
     private var partialWakeLock: PowerManager.WakeLock? = null
     private var sensorManager: SensorManager? = null
     private var isNearPocket = false
 
-    private var lastDirection = 0
-    private var lastPressMs = 0L
+    private var savedVolumeBeforeSleep: Int = -1
+    private var lastSelfVolumeAdjustMs: Long = 0L
+    private var lastRawStepMs: Long = 0L
+    private var lastDirection: Int = 0
+    private var lastClickMs: Long = 0L
+
+    private val screenAndVolumeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    onScreenTurnedOff()
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    onScreenTurnedOn()
+                }
+                VOLUME_CHANGED_ACTION -> {
+                    if (powerManager.isInteractive) return
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastSelfVolumeAdjustMs < 350L) return
+
+                    val streamType = intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1)
+                    if (streamType != AudioManager.STREAM_MUSIC) return
+
+                    val newVol = intent.getIntExtra(EXTRA_VOLUME_STREAM_VALUE, -1)
+                    val prevVol = intent.getIntExtra(EXTRA_PREV_VOLUME_STREAM_VALUE, -1)
+                    if (newVol < 0 || prevVol < 0 || newVol == prevVol) return
+
+                    val direction = if (newVol > prevVol) 1 else -1
+                    keepVolumeAwayFromEdges(newVol)
+                    handleScreenOffVolumeStep(direction, "VolumeBroadcast")
+                }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         createNotificationChannel()
 
         val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -594,22 +684,31 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
         ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), fgType)
         WakeManager.isForegroundServiceRunning = true
 
-        if (WakeConfig.POCKET_PROTECTION) {
-            sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-            sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)?.let {
-                sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-            }
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)?.let {
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
 
-        // Always keep a lightweight CPU partial wake lock so screen-off volume buttons fire
         acquireCpuWakeLock()
+        initMediaSessionVolumeIntercept()
 
-        if (WakeConfig.WAKE_ENGINE == "MEDIA_SESSION") {
-            primeSilentAudioForMediaSession()
-            initMediaSessionVolumeIntercept()
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(VOLUME_CHANGED_ACTION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenAndVolumeReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(screenAndVolumeReceiver, filter)
         }
 
-        WakeManager.recordEvent(this, "Screen-Off Wake Service started")
+        if (!powerManager.isInteractive) {
+            onScreenTurnedOff()
+        }
+
+        WakeManager.recordEvent(this, "Wake Service ready (Screen-Off Audio + Volume listener)")
     }
 
     private fun acquireCpuWakeLock() {
@@ -625,47 +724,106 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
         }
     }
 
-    /**
-     * Android 8+ ignores MediaSession volume routing until the app has played at least one
-     * audio buffer. Writing 40ms of 0-amplitude silence activates routing silently.
-     */
-    private fun primeSilentAudioForMediaSession() {
-        Thread {
+    private fun onScreenTurnedOff() {
+        lastClickMs = 0L
+        lastDirection = 0
+
+        // Nudge music volume 1 step away from 0 or max so both Vol+ and Vol- fire events
+        try {
+            val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            savedVolumeBeforeSleep = current
+            if (max >= 2 && (current <= 0 || current >= max)) {
+                val safe = if (current <= 0) 1 else max - 1
+                lastSelfVolumeAdjustMs = SystemClock.elapsedRealtime()
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, safe, 0)
+            }
+        } catch (_: Exception) {
+        }
+
+        // Start 0-volume looping silent AudioTrack ONLY while screen is off so Android routes volume presses
+        startSilentLoopWhileScreenOff()
+        mediaSession?.isActive = true
+    }
+
+    private fun onScreenTurnedOn() {
+        stopSilentLoop()
+        mediaSession?.isActive = false
+
+        // Restore original volume if we nudged it while screen was off
+        if (savedVolumeBeforeSleep >= 0) {
             try {
-                val sampleRate = 8000
-                val bufferSize = AudioTrack.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                ).coerceAtLeast(640)
-
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufferSize)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-
-                val silence = ByteArray(bufferSize)
-                track.write(silence, 0, silence.size)
-                track.play()
-                Thread.sleep(60)
-                track.stop()
-                track.release()
+                lastSelfVolumeAdjustMs = SystemClock.elapsedRealtime()
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedVolumeBeforeSleep, 0)
             } catch (_: Exception) {
             }
-        }.start()
+            savedVolumeBeforeSleep = -1
+        }
+    }
+
+    private fun keepVolumeAwayFromEdges(currentVol: Int) {
+        try {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            if (max >= 2 && (currentVol <= 0 || currentVol >= max)) {
+                val safe = (savedVolumeBeforeSleep).coerceIn(1, max - 1)
+                lastSelfVolumeAdjustMs = SystemClock.elapsedRealtime()
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, safe, 0)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun startSilentLoopWhileScreenOff() {
+        if (silentAudioTrack != null) return
+        try {
+            val sampleRate = 8000
+            val minBytes = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(1600)
+            val bufferBytes = if (minBytes % 2 == 0) minBytes else minBytes + 1
+            val frameCount = bufferBytes / 2
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufferBytes)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+
+            val silence = ByteArray(bufferBytes)
+            track.write(silence, 0, silence.size)
+            track.setLoopPoints(0, frameCount, -1)
+            track.setVolume(0f)
+            track.play()
+            silentAudioTrack = track
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun stopSilentLoop() {
+        val track = silentAudioTrack ?: return
+        silentAudioTrack = null
+        try {
+            track.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            track.release()
+        } catch (_: Exception) {
+        }
     }
 
     private fun initMediaSessionVolumeIntercept() {
@@ -680,19 +838,23 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
 
         val volumeProvider = object : VolumeProviderCompat(VOLUME_CONTROL_RELATIVE, 100, 50) {
             override fun onAdjustVolume(direction: Int) {
-                // Keep virtual level centered at 50 so Android never clamps out repeated presses
                 currentVolume = 50
                 if (direction == 0 || powerManager.isInteractive) return
-                handleScreenOffVolumeStep(direction)
+                handleScreenOffVolumeStep(direction, "MediaSession")
             }
         }
 
         session.setPlaybackToRemote(volumeProvider)
-        session.isActive = true
+        session.isActive = false
         mediaSession = session
     }
 
-    private fun handleScreenOffVolumeStep(direction: Int) {
+    private fun handleScreenOffVolumeStep(direction: Int, channel: String) {
+        val now = SystemClock.elapsedRealtime()
+        // Deduplicate if both MediaSession and VolumeBroadcast fire for the same physical click
+        if (now - lastRawStepMs < 75L) return
+        lastRawStepMs = now
+
         val isUp = direction > 0
         val matchesTarget = when (WakeConfig.WAKE_KEY) {
             "VOL_UP" -> isUp
@@ -702,29 +864,32 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
         if (!matchesTarget) return
 
         val keyName = if (isUp) "Vol+" else "Vol-"
-        val now = SystemClock.elapsedRealtime()
-        val delta = now - lastPressMs
-        val isDouble = (direction == lastDirection) && (delta in 1..WakeConfig.DOUBLE_CLICK_WINDOW_MS)
+        val activeWakeMode = WakeManager.wakeGestureMode
 
-        if (WakeConfig.WAKE_GESTURE == "SINGLE_CLICK") {
-            wakeIfAllowed("$keyName MediaSession Single")
-            lastPressMs = 0L
+        if (activeWakeMode == "SINGLE_CLICK") {
+            lastClickMs = 0L
+            wakeIfAllowed("$keyName Single ($channel)")
             return
         }
 
-        if (WakeConfig.WAKE_GESTURE == "DOUBLE_CLICK" && isDouble) {
-            lastPressMs = 0L
-            wakeIfAllowed("$keyName MediaSession Double (\${delta}ms)")
+        val delta = now - lastClickMs
+        val screenOffWindowMs = maxOf(WakeConfig.DOUBLE_CLICK_WINDOW_MS, 800L)
+        val sameOrEither = (direction == lastDirection) || (WakeConfig.WAKE_KEY == "EITHER")
+        val isDouble = sameOrEither && (delta in 1..screenOffWindowMs)
+
+        if (isDouble) {
+            lastClickMs = 0L
+            wakeIfAllowed("$keyName Double (\${delta}ms · $channel)")
             return
         }
 
         lastDirection = direction
-        lastPressMs = now
-        WakeManager.recordEvent(this, "$keyName step 1/2 via MediaSession")
+        lastClickMs = now
+        WakeManager.recordEvent(this, "$keyName click 1/2 ($channel) — press again to wake")
     }
 
     private fun wakeIfAllowed(source: String) {
-        if (WakeConfig.POCKET_PROTECTION && isNearPocket) {
+        if (WakeManager.pocketProtectionEnabled && isNearPocket) {
             WakeManager.recordEvent(this, "Wake blocked by proximity sensor")
             return
         }
@@ -741,17 +906,17 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("${safeAppName} Running")
-            .setContentText("Wake: ${formatWakeGestureLabel(config.wakeGesture)} (${formatKeyLabel(config.wakeKey)})")
+            .setContentText("Screen-off Volume Wake active (${formatKeyLabel(config.wakeKey)})")
             .setSmallIcon(android.R.drawable.ic_lock_power_off)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(openAppIntent)
 
         if (WakeConfig.PERSISTENT_NOTIFICATION_LOCK) {
-            val lockIntent = PendingIntent.getBroadcast(
+            val lockIntent = PendingIntent.getService(
                 this,
                 1,
-                Intent(WakeConfig.ACTION_LOCK_SCREEN_NOW).setPackage(packageName),
+                Intent(this, ScreenWakeForegroundService::class.java).setAction(WakeConfig.ACTION_LOCK_SCREEN_NOW),
                 PendingIntent.FLAG_IMMUTABLE
             )
             builder.addAction(android.R.drawable.ic_lock_lock, "Lock Screen Now", lockIntent)
@@ -773,16 +938,26 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == WakeConfig.ACTION_LOCK_SCREEN_NOW) {
+            if (!WakeManager.lockScreenViaAdminIfEnabled(this)) {
+                sendBroadcast(Intent(WakeConfig.ACTION_LOCK_SCREEN_NOW).setPackage(packageName))
+            }
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
         WakeManager.isForegroundServiceRunning = false
+        stopSilentLoop()
         mediaSession?.isActive = false
         mediaSession?.release()
         partialWakeLock?.let { if (it.isHeld) it.release() }
         sensorManager?.unregisterListener(this)
+        try {
+            unregisterReceiver(screenAndVolumeReceiver)
+        } catch (_: Exception) {
+        }
         WakeManager.recordEvent(this, "Screen-Off Wake Service stopped")
     }
 
@@ -798,15 +973,32 @@ class ScreenWakeForegroundService : Service(), SensorEventListener {
     companion object {
         private const val CHANNEL_ID = "c2_wake_service_channel"
         private const val NOTIFICATION_ID = 1941
+        private const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
+        private const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
+        private const val EXTRA_VOLUME_STREAM_VALUE = "android.media.EXTRA_VOLUME_STREAM_VALUE"
+        private const val EXTRA_PREV_VOLUME_STREAM_VALUE = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE"
     }
 }
+`;
+
+  const lockDeviceAdminKt = `package ${config.packageName}
+
+import android.app.admin.DeviceAdminReceiver
+
+/**
+ * Allows locking the screen via DevicePolicyManager.lockNow() even when Android 13-15
+ * blocks Accessibility under Restricted Settings.
+ */
+class LockDeviceAdminReceiver : DeviceAdminReceiver()
 `;
 
   const mainActivityKt = `package ${config.packageName}
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -878,11 +1070,11 @@ class MainActivity : AppCompatActivity() {
         lastEventView = TextView(this).apply {
             textSize = 12f
             setTextColor(Color.parseColor("#92400E"))
-            setPadding(0, 16, 0, 28)
+            setPadding(0, 16, 0, 24)
         }
 
         val startServiceBtn = Button(this).apply {
-            text = "1. Start Screen-Off Wake Service"
+            text = "1. Start Screen-Off Wake Service (Volume Wake)"
             setOnClickListener {
                 ensureNotificationPermission()
                 try {
@@ -896,8 +1088,57 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val overlayBtn = Button(this).apply {
+            text = "2. Allow 'Appear on Top' (Wakes Screen Without Accessibility)"
+            setOnClickListener {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                        startActivity(intent)
+                    } catch (_: Exception) {
+                        val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:$packageName")
+                        }
+                        startActivity(fallback)
+                    }
+                }
+            }
+        }
+
+        val adminLockBtn = Button(this).apply {
+            text = "3. Enable Device Admin Lock (Locks Screen Without Accessibility)"
+            setOnClickListener {
+                val adminComponent = ComponentName(this@MainActivity, LockDeviceAdminReceiver::class.java)
+                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Allows locking the screen from the app and notification bar without needing Accessibility."
+                    )
+                }
+                try {
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(intent, 2002)
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS))
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Open Device Admin Apps and enable ${safeAppName}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } catch (e: Exception) {
+                        Toast.makeText(this@MainActivity, "Error: \${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+
         val appInfoBtn = Button(this).apply {
-            text = "2. Android 13/14: Allow Restricted Settings (3-dot menu)"
+            text = "4. Optional (Android 13-15): Allow Restricted Settings (⋮ menu)"
             setOnClickListener {
                 val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                     data = Uri.parse("package:$packageName")
@@ -905,21 +1146,21 @@ class MainActivity : AppCompatActivity() {
                 startActivity(intent)
                 Toast.makeText(
                     this@MainActivity,
-                    "Tap top-right 3 dots -> Allow restricted settings (if shown)",
+                    "Tap top-right 3 dots -> Allow restricted settings (On Samsung, turn off Auto Blocker if ⋮ is missing)",
                     Toast.LENGTH_LONG
                 ).show()
             }
         }
 
         val accessibilityBtn = Button(this).apply {
-            text = "3. Enable Accessibility Service (Required)"
+            text = "5. Optional: Enable Accessibility (For Volume-Button Lock)"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
 
         val batteryBtn = Button(this).apply {
-            text = "4. Allow Background Running (Battery)"
+            text = "6. Allow Background Running (Battery)"
             setOnClickListener {
                 val pm = getSystemService(POWER_SERVICE) as PowerManager
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !pm.isIgnoringBatteryOptimizations(packageName)) {
@@ -936,34 +1177,58 @@ class MainActivity : AppCompatActivity() {
         val testLockBtn = Button(this).apply {
             text = "Test A: Lock Screen Now"
             setOnClickListener {
-                if (!isAccessibilityServiceEnabled()) {
+                if (!triggerLockAnyMethod()) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Enable Accessibility Service (Step 3) first!",
+                        "Enable Step 3 (Device Admin Lock) or Step 5 (Accessibility) first!",
                         Toast.LENGTH_LONG
                     ).show()
-                    return@setOnClickListener
                 }
-                sendBroadcast(Intent(WakeConfig.ACTION_LOCK_SCREEN_NOW).setPackage(packageName))
             }
         }
 
         val testAutoWakeBtn = Button(this).apply {
             text = "Test B: Lock Now & Auto-Wake in 5 Seconds"
             setOnClickListener {
-                if (!isAccessibilityServiceEnabled()) {
+                if (!triggerLockAnyMethod()) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Enable Accessibility Service (Step 3) first!",
+                        "Enable Step 3 (Device Admin Lock) or Step 5 (Accessibility) first!",
                         Toast.LENGTH_LONG
                     ).show()
                     return@setOnClickListener
                 }
                 Toast.makeText(this@MainActivity, "Locking now — screen will wake in 5s", Toast.LENGTH_SHORT).show()
-                sendBroadcast(Intent(WakeConfig.ACTION_LOCK_SCREEN_NOW).setPackage(packageName))
                 handler.postDelayed({
                     WakeManager.wakeScreen(applicationContext, "5s Self-Test")
                 }, 5000L)
+            }
+        }
+
+        val toggleWakeModeBtn = Button(this).apply {
+            text = "Switch Wake Mode (Single Click / Double Click)"
+            setOnClickListener {
+                WakeManager.wakeGestureMode =
+                    if (WakeManager.wakeGestureMode == "SINGLE_CLICK") "DOUBLE_CLICK" else "SINGLE_CLICK"
+                Toast.makeText(
+                    this@MainActivity,
+                    "Wake mode set to: \${WakeManager.wakeGestureMode}",
+                    Toast.LENGTH_SHORT
+                ).show()
+                refreshStatus()
+            }
+        }
+
+        val togglePocketBtn = Button(this).apply {
+            text = "Toggle Pocket Protection (ON / OFF)"
+            setOnClickListener {
+                WakeManager.pocketProtectionEnabled = !WakeManager.pocketProtectionEnabled
+                Toast.makeText(
+                    this@MainActivity,
+                    "Pocket Protection: \${if (WakeManager.pocketProtectionEnabled) "ON" else "OFF"}",
+                    Toast.LENGTH_SHORT
+                ).show()
+                refreshStatus()
             }
         }
 
@@ -972,9 +1237,13 @@ class MainActivity : AppCompatActivity() {
         container.addView(statusView)
         container.addView(lastEventView)
         container.addView(startServiceBtn)
+        container.addView(overlayBtn)
+        container.addView(adminLockBtn)
         container.addView(appInfoBtn)
         container.addView(accessibilityBtn)
         container.addView(batteryBtn)
+        container.addView(toggleWakeModeBtn)
+        container.addView(togglePocketBtn)
         container.addView(testLockBtn)
         container.addView(testAutoWakeBtn)
 
@@ -982,6 +1251,17 @@ class MainActivity : AppCompatActivity() {
         setContentView(scroll)
 
         ensureNotificationPermission()
+    }
+
+    private fun triggerLockAnyMethod(): Boolean {
+        if (WakeManager.lockScreenViaAdminIfEnabled(this)) {
+            return true
+        }
+        if (isAccessibilityServiceEnabled()) {
+            sendBroadcast(Intent(WakeConfig.ACTION_LOCK_SCREEN_NOW).setPackage(packageName))
+            return true
+        }
+        return false
     }
 
     override fun onResume() {
@@ -994,6 +1274,23 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(statusReceiver, filter)
         }
         refreshStatus()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 2002) {
+            refreshStatus()
+            if (isDeviceAdminEnabled()) {
+                Toast.makeText(this, "Device Admin Lock enabled!", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    "Device Admin not activated. On ColorOS/Realme, wait for the Activate countdown or use Step 5 (Accessibility).",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     override fun onPause() {
@@ -1024,17 +1321,27 @@ class MainActivity : AppCompatActivity() {
         return enabled.any { it.resolveInfo?.serviceInfo?.packageName == packageName }
     }
 
+    private fun isDeviceAdminEnabled(): Boolean {
+        val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        return dpm.isAdminActive(ComponentName(this, LockDeviceAdminReceiver::class.java))
+    }
+
     private fun refreshStatus() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         val batteryOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || pm.isIgnoringBatteryOptimizations(packageName)
+        val overlayOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+        val adminOk = isDeviceAdminEnabled()
         val a11yOk = isAccessibilityServiceEnabled()
         val fgOk = WakeManager.isForegroundServiceRunning
 
         statusView.text = """
-            LIVE DIAGNOSTIC STATUS
-            • Wake Foreground Service: \${if (fgOk) "RUNNING" else "STOPPED (Tap Step 1)"}
-            • Accessibility Key Filter: \${if (a11yOk) "ENABLED" else "OFF (Tap Step 2 then Step 3)"}
-            • Battery Optimization: \${if (batteryOk) "UNRESTRICTED" else "RESTRICTED (Tap Step 4)"}
+            LIVE DIAGNOSTIC STATUS (v1.3.0)
+            • Wake Service (Vol Wake): \${if (fgOk) "RUNNING" else "STOPPED (Tap Step 1)"}
+            • Wake Trigger: \${WakeManager.wakeGestureMode} · Pocket Guard: \${if (WakeManager.pocketProtectionEnabled) "ON" else "OFF"}
+            • Appear on Top (Wake): \${if (overlayOk) "ALLOWED" else "NEEDED (Tap Step 2)"}
+            • Device Admin (Lock): \${if (adminOk) "ENABLED" else "OFF (Tap Step 3)"}
+            • Accessibility (Vol Lock): \${if (a11yOk) "ENABLED" else "OFF (Step 4 -> Step 5)"}
+            • Battery Optimization: \${if (batteryOk) "UNRESTRICTED" else "RESTRICTED (Tap Step 6)"}
         """.trimIndent()
 
         lastEventView.text = "Last Event: \${WakeManager.lastEventSummary}"
@@ -1077,8 +1384,8 @@ android {
         applicationId = "${config.packageName}"
         minSdk = 26 // Supports Android 8.0 through Android 15 (Realme C2 & RMX3998)
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.3.0"
     }
 
     buildTypes {
@@ -1227,8 +1534,15 @@ Supports **Realme C2 (Android 9 / ColorOS 6)** and **Realme 12x 5G RMX3998 (Andr
       path: `app/src/main/java/${pkgPath}/MainActivity.kt`,
       language: 'kotlin',
       category: 'UI & Receivers',
-      summary: 'Live diagnostic dashboard with Android 13/14 Restricted Settings shortcut, permission checks, and 5-second Auto-Wake Self-Test.',
+      summary: 'Live diagnostic dashboard supporting both No-Accessibility mode (Appear on Top + Device Admin) and full Accessibility mode.',
       content: mainActivityKt,
+    },
+    {
+      path: `app/src/main/java/${pkgPath}/LockDeviceAdminReceiver.kt`,
+      language: 'kotlin',
+      category: 'UI & Receivers',
+      summary: 'Device Admin receiver allowing instant screen lock even when Restricted Settings blocks Accessibility.',
+      content: lockDeviceAdminKt,
     },
     ...(config.startOnBoot
       ? [
@@ -1245,8 +1559,15 @@ Supports **Realme C2 (Android 9 / ColorOS 6)** and **Realme 12x 5G RMX3998 (Andr
       path: 'app/src/main/AndroidManifest.xml',
       language: 'xml',
       category: 'Manifest & Res',
-      summary: 'Declares WakeHelperActivity, AccessibilityService, Foreground Service, and Android 9–14 permissions.',
+      summary: 'Declares WakeHelperActivity, AccessibilityService, DeviceAdminReceiver, Foreground Service, and Android 9–15 permissions.',
       content: manifestXml,
+    },
+    {
+      path: 'app/src/main/res/xml/device_admin_policies.xml',
+      language: 'xml',
+      category: 'Manifest & Res',
+      summary: 'Declares force-lock policy for Device Admin screen lock fallback.',
+      content: deviceAdminXml,
     },
     {
       path: 'app/src/main/res/xml/accessibility_service_config.xml',
@@ -1321,7 +1642,7 @@ export async function downloadAndroidProjectZip(config: C2WakeConfig): Promise<v
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = `${(config.appName.trim() || 'C2Wake').replace(/\s+/g, '-')}-Realme-Android-v1.1.zip`;
+  anchor.download = `${(config.appName.trim() || 'C2Wake').replace(/\s+/g, '-')}-Realme-Android-v1.3.zip`;
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
